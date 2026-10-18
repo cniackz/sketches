@@ -232,10 +232,10 @@ func (t *TDigest) Encode() []byte {
 }
 
 // DecodeTDigest parses the output of Encode. It bounds the centroid count by the
-// compression and the remaining bytes, and requires the means to be sorted and the
-// weights positive and finite, so a malformed length or a bad centroid cannot force
-// a large allocation or a non-monotone digest. It returns an error wrapping
-// ErrBadData or ErrUnsupportedVersion.
+// compression and the remaining bytes, requires the means to be sorted and the weights
+// positive and finite, and requires their running sum to stay finite, so a malformed
+// length or a bad centroid cannot force a large allocation, a non-monotone digest, or an
+// infinite total weight. It returns an error wrapping ErrBadData or ErrUnsupportedVersion.
 func DecodeTDigest(data []byte) (*TDigest, error) {
 	r := &reader{b: data}
 	m0, err := r.readByte()
@@ -305,6 +305,12 @@ func DecodeTDigest(data []byte) (*TDigest, error) {
 		prevMean = mean
 		cs = append(cs, centroid{mean, w})
 		total += w
+		// Each weight is finite, but the running sum can still overflow to +Inf (two
+		// weights near 1.75e308 do it). An infinite total poisons Quantile into NaN, so a
+		// sum that overflows is rejected, the decode analog of the Add weight-overflow guard.
+		if math.IsInf(total, 0) {
+			return nil, fmt.Errorf("%w: centroid weights overflow the total weight", ErrBadData)
+		}
 	}
 	if !r.atEnd() {
 		return nil, fmt.Errorf("%w: %d trailing bytes", ErrBadData, r.remaining())

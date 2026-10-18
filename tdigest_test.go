@@ -292,6 +292,31 @@ func TestTDigestQuantileNoOverflow(t *testing.T) {
 	}
 }
 
+// TestTDigestDecodeRejectsWeightOverflow is posterior R3-B: decode summed the centroid
+// weights without a running overflow check, so two finite weights near 1.75e308 made
+// totalWeight +Inf and Quantile returned NaN with no error. It is the decode analog of
+// T1. The bytes are built by hand because Encode would compress and merge the two
+// centroids before writing them.
+func TestTDigestDecodeRejectsWeightOverflow(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(tdMagic0)
+	buf.WriteByte(tdMagic1)
+	buf.WriteByte(tdVersion)
+	putFloat(&buf, 100) // compression
+	putFloat(&buf, -1)  // min
+	putFloat(&buf, 1)   // max
+	putUvarint(&buf, 2) // two centroids
+	putFloat(&buf, -1)
+	putFloat(&buf, 1.75e308) // finite on its own
+	putFloat(&buf, 1)
+	putFloat(&buf, 1.75e308) // finite on its own, but the sum overflows
+	dec, err := DecodeTDigest(buf.Bytes())
+	if err == nil {
+		q, _ := dec.Quantile(0.5)
+		t.Fatalf("decode should reject weights that sum to +Inf (Quantile(0.5)=%g)", q)
+	}
+}
+
 func TestTDigestDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},
