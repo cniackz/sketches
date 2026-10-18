@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"math/bits"
 )
 
 // cmMaxCells caps w*d so a constructor or a decoder cannot be asked to allocate an
@@ -150,7 +149,11 @@ func (c *CountMin) Merge(other *CountMin) error {
 	return nil
 }
 
-const cmMagic0, cmMagic1, cmVersion = 'C', 'M', 1
+// cmVersion is 2: version 1 used a correlated double-hashing scheme (h1 + r*h2), so a
+// v1 blob decoded under the current independent per-row hash would read its counters
+// from the wrong columns and underestimate. Decode rejects version 1 rather than
+// reading it wrong.
+const cmMagic0, cmMagic1, cmVersion = 'C', 'M', 2
 
 // Encode returns the binary form of the sketch. Decode reverses it.
 func (c *CountMin) Encode() []byte {
@@ -227,15 +230,15 @@ func DecodeCountMin(data []byte) (*CountMin, error) {
 	if !r.atEnd() {
 		return nil, fmt.Errorf("%w: %d trailing bytes", ErrBadData, r.remaining())
 	}
-	// Every add touches exactly one cell per row, so each row must sum to the total.
-	// A row that does not is a forged or corrupt sketch and is rejected.
+	// Every add touches exactly one cell per row with the same count, so each row
+	// receives the same multiset of counts as the total, and its saturating sum must
+	// equal the stored total. The sum uses satAdd64, the same saturation Add uses, so a
+	// sketch that saturated a cell still round trips; a row whose saturating sum does
+	// not match the total is a forged or corrupt sketch and is rejected.
 	for rw := uint32(0); rw < d; rw++ {
-		var rowSum, carry uint64
+		var rowSum uint64
 		for j := uint32(0); j < w; j++ {
-			rowSum, carry = bits.Add64(rowSum, c.counts[rw*w+j], 0)
-			if carry != 0 {
-				return nil, fmt.Errorf("%w: count-min row %d sum overflows", ErrBadData, rw)
-			}
+			rowSum = satAdd64(rowSum, c.counts[rw*w+j])
 		}
 		if rowSum != total {
 			return nil, fmt.Errorf("%w: count-min row %d sums to %d, stored total %d", ErrBadData, rw, rowSum, total)

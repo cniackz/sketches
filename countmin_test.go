@@ -228,6 +228,45 @@ func TestCountMinDecodeRejectsRowSum(t *testing.T) {
 	}
 }
 
+// TestCountMinRejectsOldFormat is posterior R2-F: the per-row hash family changed but
+// the format version did not, so a blob written by the old code (version 1, correlated
+// double hashing) decoded under the new hash and underestimated. Bumping the version
+// makes decode reject a version-1 blob instead of reading it from the wrong columns.
+func TestCountMinRejectsOldFormat(t *testing.T) {
+	c, _ := NewCountMin(0.1, 0.1)
+	c.Add([]byte("x"), 5)
+	enc := c.Encode()
+	if enc[2] != cmVersion {
+		t.Fatalf("version byte is %d, expected %d", enc[2], cmVersion)
+	}
+	old := append([]byte(nil), enc...)
+	old[2] = 1
+	if _, err := DecodeCountMin(old); err == nil {
+		t.Fatal("a version-1 blob used a correlated hash family and must be rejected")
+	}
+}
+
+// TestCountMinSaturatedRoundTrip is posterior R2-G: a count large enough to saturate a
+// cell (and the total) used to fail its own round trip, because decode rejected the
+// overflowing row. Decode now sums each row with the same saturating add as Add, so a
+// saturated sketch is accepted and encode/decode stay consistent.
+func TestCountMinSaturatedRoundTrip(t *testing.T) {
+	c, _ := NewCountMin(0.01, 0.01)
+	c.AddHash(111, math.MaxUint64)
+	c.AddHash(222, 1000) // pushes the total past MaxUint64, so it saturates
+	if c.Total() != math.MaxUint64 {
+		t.Fatalf("total %d should have saturated at MaxUint64", c.Total())
+	}
+	enc := c.Encode()
+	dec, err := DecodeCountMin(enc)
+	if err != nil {
+		t.Fatalf("a saturated sketch must round trip, got: %v", err)
+	}
+	if !bytes.Equal(dec.Encode(), enc) {
+		t.Fatal("re-encode of a saturated sketch differs")
+	}
+}
+
 func TestCountMinDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},
