@@ -62,9 +62,15 @@ func (h *HLL) indexRank(x uint64) (uint32, uint8) {
 }
 
 // AddHash records the item identified by the precomputed 64-bit hash x. It is the
-// hash door for callers who bring their own hash; Add hashes the bytes with the
-// package's fixed mixer.
+// hash door for callers who bring their own hash, which must be well distributed over
+// the 64 bits (the estimate reads the top p bits as the register and the leading
+// zeros of the rest as the rank, so sequential or low-entropy values estimate badly);
+// Add hashes the bytes with the package's fixed mixer. A call on a zero-value sketch
+// is a no-op.
 func (h *HLL) AddHash(x uint64) {
+	if h.m == 0 {
+		return
+	}
 	idx, rank := h.indexRank(x)
 	if h.dense != nil {
 		if rank > h.dense[idx] {
@@ -142,6 +148,9 @@ func (h *HLL) Estimate() uint64 {
 // Merge folds other into h. Both must have the same precision; a mismatch returns
 // an error wrapping ErrIncompatibleMerge.
 func (h *HLL) Merge(other *HLL) error {
+	if other == nil {
+		return fmt.Errorf("%w: cannot merge a nil HLL", ErrInvalidInput)
+	}
 	if other.p != h.p {
 		return fmt.Errorf("%w: HLL precisions %d and %d differ", ErrIncompatibleMerge, h.p, other.p)
 	}

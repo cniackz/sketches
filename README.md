@@ -32,6 +32,11 @@ error returns to about `1.04/sqrt(m)`.
 
 DDSketch carries a worst-case bound; t-digest does not. Use DDSketch when you need a
 provable relative error, and t-digest when tail accuracy at a small size matters more.
+For t-digest, "finest resolution in the tails" means its clusters are narrowest in `q`
+near `q=0` and `q=1`, not that the realized error is smallest there: on a smooth
+density the relative rank error at the extreme quantiles can be larger than at the
+median, where the points are denser. The merge of DDSketch, HyperLogLog and count-min
+is exactly order-independent; t-digest's is only approximately so.
 
 ## Usage
 
@@ -73,9 +78,9 @@ centroids and so slightly different quantiles, within the usual empirical accura
 returns a versioned binary form that `DecodeDDSketch`, `DecodeHLL`,
 `DecodeCountMin` and `DecodeTDigest` parse back. HyperLogLog has a sparse form for
 low cardinality and a dense form for high; the format byte records which, and both
-are covered by the decode fuzz tests. The count-min row hashes are derived
-deterministically from the parameters (row `r` uses `h1 + r*h2`), so no seed is
-stored and a decoded sketch uses the same hash family.
+are covered by the decode fuzz tests. Each count-min row derives an independent column
+by mixing the key's base hash with a distinct per-row constant, so no seed is stored
+and a decoded sketch uses the same hash family.
 
 ## Hashing
 
@@ -100,7 +105,7 @@ Measured on an arm64 laptop; your numbers will differ.
 |---|---|---|
 | DDSketch Add | ~26 ns | 0 |
 | HyperLogLog Add | ~1.5 ns | 0 |
-| count-min Add | ~5.5 ns | 0 |
+| count-min Add | ~9 ns (grows with depth d) | 0 |
 | t-digest Add | ~97 ns | 0 amortized |
 
 Memory: DDSketch grows with the logarithm of the data range (648 buckets for a

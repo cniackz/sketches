@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -12,9 +13,10 @@ import (
 // alpha relative error of the true q-quantile of the data: |Quantile(q) - x_q| <=
 // alpha*|x_q|. An alpha below 1e-9 is rejected because float64 cannot honor it. It
 // handles finite reals through a logarithmic bucketing of the magnitude, with a
-// mirror store for negatives and a separate counter for zero; a magnitude so extreme
-// that its bucket boundary would overflow or underflow in float64 (near the ends of
-// the float64 range) is rejected by Add, since the guarantee cannot hold there.
+// mirror store for negatives and a separate counter for zero; the whole subnormal
+// range is supported, but a magnitude so large that its bucket boundary would
+// overflow float64 (near MaxFloat64) is rejected by Add, since the representative
+// value could not be formed there.
 // Memory grows with the logarithm of the data range, not with the count. An
 // optional bucket cap (off by default) bounds memory by collapsing the
 // lowest-magnitude buckets, which relaxes the guarantee for those values only.
@@ -60,19 +62,18 @@ func newDD(alpha float64, maxBuckets int) (*DDSketch, error) {
 		neg:        map[int]uint64{},
 		maxBuckets: maxBuckets,
 	}
-	// Precompute the index range whose representative value stays in the normal
-	// float64 range. Above it the value overflows toward +Inf; below it the value
-	// falls into the subnormals, where relative precision degrades below alpha. In
-	// either case the relative-error guarantee cannot be honored, so Add and decode
-	// reject it. The bound is a one-time O(1) compare per Add, not a per-Add Exp.
-	const minNormal = 0x1p-1022 // smallest positive normal float64
+	// Precompute the index range whose representative value stays finite and nonzero.
+	// Above it the value overflows toward +Inf (near MaxFloat64), so Add and decode
+	// reject it; below it the value would underflow to 0, but no representable positive
+	// float maps there, so the whole subnormal range stays usable. The bound is a
+	// one-time O(1) compare per Add, not a per-Add Exp.
 	lnVmul := math.Log(s.vmul)
 	s.maxIdx = int(math.Floor((math.Log(math.MaxFloat64) - lnVmul) / s.logGamma))
-	s.minIdx = int(math.Ceil((math.Log(minNormal) - lnVmul) / s.logGamma))
+	s.minIdx = int(math.Ceil((math.Log(math.SmallestNonzeroFloat64) - lnVmul) / s.logGamma))
 	for s.maxIdx > s.minIdx && math.IsInf(s.value(s.maxIdx), 0) {
 		s.maxIdx--
 	}
-	for s.minIdx < s.maxIdx && s.value(s.minIdx) < minNormal {
+	for s.minIdx < s.maxIdx && s.value(s.minIdx) == 0 {
 		s.minIdx++
 	}
 	return s, nil
@@ -115,10 +116,12 @@ func (s *DDSketch) index(magnitude float64) int {
 func (s *DDSketch) value(i int) float64 { return math.Exp(float64(i)*s.logGamma) * s.vmul }
 
 // Add records a value. A NaN or infinite value, or a finite value whose magnitude is
-// so extreme (near the ends of the float64 range) that its bucket boundary would
-// overflow or underflow, is rejected with an error wrapping ErrInvalidInput and
-// leaves the sketch unchanged.
+// so large (near MaxFloat64) that its bucket boundary would overflow float64, is
+// rejected with an error wrapping ErrInvalidInput and leaves the sketch unchanged.
 func (s *DDSketch) Add(v float64) error {
+	if s.pos == nil {
+		return fmt.Errorf("%w: use NewDDSketch to create a DDSketch", ErrInvalidInput)
+	}
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return fmt.Errorf("%w: cannot add %g to a DDSketch", ErrInvalidInput, v)
 	}
@@ -215,6 +218,9 @@ func (s *DDSketch) Quantile(q float64) (float64, error) {
 // error wrapping ErrIncompatibleMerge. The receiver's bucket cap, if any, is
 // applied after merging.
 func (s *DDSketch) Merge(other *DDSketch) error {
+	if other == nil {
+		return fmt.Errorf("%w: cannot merge a nil DDSketch", ErrInvalidInput)
+	}
 	if other.alpha != s.alpha {
 		return fmt.Errorf("%w: DDSketch alphas %g and %g differ", ErrIncompatibleMerge, s.alpha, other.alpha)
 	}
@@ -327,7 +333,6 @@ func DecodeDDSketch(data []byte) (*DDSketch, error) {
 		return nil, err
 	}
 	bucketCap := maxPossibleBuckets(s.logGamma)
-	sum := zeroCount
 	posSum, err := readBuckets(r, s, s.pos, bucketCap)
 	if err != nil {
 		return nil, err
@@ -336,7 +341,14 @@ func DecodeDDSketch(data []byte) (*DDSketch, error) {
 	if err != nil {
 		return nil, err
 	}
-	sum += posSum + negSum
+	// Combine with overflow detection: a crafted pair of counts near 2^63 can wrap to a
+	// small sum that happens to match a tiny stored total, so a wrapped sum is rejected
+	// rather than accepted as a valid sketch.
+	sum, c1 := bits.Add64(zeroCount, posSum, 0)
+	sum, c2 := bits.Add64(sum, negSum, 0)
+	if c1 != 0 || c2 != 0 {
+		return nil, fmt.Errorf("%w: bucket counts overflow uint64", ErrBadData)
+	}
 	if sum != total {
 		return nil, fmt.Errorf("%w: bucket counts sum to %d, stored total %d", ErrBadData, sum, total)
 	}
@@ -378,7 +390,11 @@ func readBuckets(r *reader, s *DDSketch, m map[int]uint64, maxCap int) (uint64, 
 			return 0, fmt.Errorf("%w: duplicate bucket index %d", ErrBadData, idx)
 		}
 		m[int(idx)] = c
-		sum += c
+		var carry uint64
+		sum, carry = bits.Add64(sum, c, 0)
+		if carry != 0 {
+			return 0, fmt.Errorf("%w: bucket counts overflow uint64", ErrBadData)
+		}
 	}
 	return sum, nil
 }

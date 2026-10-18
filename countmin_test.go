@@ -150,6 +150,84 @@ func TestCountMinParamValidation(t *testing.T) {
 	}
 }
 
+// TestCountMinRowIndependence is posterior CM2: the double-hashing scheme h1 + r*h2
+// made two keys collide in ALL d rows with probability about 1/w^2 instead of 1/w^d,
+// which broke the 1-delta bound for small delta. With independent per-row hashing an
+// all-row collision has probability (1/w)^d, so over a million keys essentially none
+// collide with a fixed heavy key in every row.
+func TestCountMinRowIndependence(t *testing.T) {
+	c, _ := NewCountMin(0.1, 1e-6) // w=28, d=14; (1/28)^14 is about 7e-21
+	heavy := c.cols(hashBytes([]byte("heavy")))
+	hcol := make([]uint32, c.d)
+	for r := uint32(0); r < c.d; r++ {
+		hcol[r] = heavy(r)
+	}
+	allCollide := 0
+	for i := 0; i < 1_000_000; i++ {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(i))
+		col := c.cols(hashBytes(b[:]))
+		all := true
+		for r := uint32(0); r < c.d; r++ {
+			if col(r) != hcol[r] {
+				all = false
+				break
+			}
+		}
+		if all {
+			allCollide++
+		}
+	}
+	// Independent rows: expectation ~0 over a million keys. The old double hashing made
+	// it ~1/w^2 per key, over a thousand here.
+	if allCollide > 2 {
+		t.Fatalf("%d keys collide with the heavy key in all %d rows; rows are not independent", allCollide, c.d)
+	}
+}
+
+// TestCountMinOverflowSaturates is posterior CM1: a count large enough to overflow a
+// cell used to wrap, making Estimate fall below the true count and break the one-sided
+// guarantee. Adds now saturate, so the estimate never underestimates.
+func TestCountMinOverflowSaturates(t *testing.T) {
+	c, _ := NewCountMin(0.01, 0.01)
+	k1 := uint64(12345)
+	col0 := c.cols(k1)(0)
+	var k2 uint64
+	for k := uint64(1); ; k++ {
+		if k != k1 && c.cols(k)(0) == col0 {
+			k2 = k
+			break
+		}
+	}
+	c.AddHash(k1, 1<<63)
+	c.AddHash(k2, 1<<63)
+	if e := c.EstimateHash(k1); e < 1<<63 {
+		t.Fatalf("Estimate %d is below the true 2^63 (a cell wrapped instead of saturating)", e)
+	}
+}
+
+// TestCountMinDecodeRejectsRowSum is posterior CM3: decode did not check that each row
+// sums to the stored total, so a forged cell slipped through. It now rejects such a
+// sketch. It also covers Merge(nil) and the zero value, which must not panic.
+func TestCountMinDecodeRejectsRowSum(t *testing.T) {
+	c, _ := NewCountMin(0.5, 0.5)
+	c.Add([]byte("a"), 3)
+	enc := c.Encode()
+	enc[len(enc)-1] = 100 // inflate the last cell so its row no longer sums to the total
+	if _, err := DecodeCountMin(enc); err == nil {
+		t.Fatal("decode should reject a row that does not sum to the total")
+	}
+	good, _ := NewCountMin(0.01, 0.01)
+	if err := good.Merge(nil); err == nil {
+		t.Fatal("Merge(nil) should return an error, not panic")
+	}
+	var z CountMin
+	z.Add([]byte("x"), 1) // zero value must not panic
+	if z.EstimateHash(0) != 0 {
+		t.Fatal("zero-value estimate should be 0")
+	}
+}
+
 func TestCountMinDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},

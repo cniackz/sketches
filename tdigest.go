@@ -50,6 +50,9 @@ func (t *TDigest) Add(v float64) error { return t.AddWeighted(v, 1) }
 // overflow to infinity is rejected with an error wrapping ErrInvalidInput and leaves
 // the digest unchanged.
 func (t *TDigest) AddWeighted(v, w float64) error {
+	if t.compression == 0 {
+		return fmt.Errorf("%w: use NewTDigest to create a TDigest", ErrInvalidInput)
+	}
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return fmt.Errorf("%w: cannot add %g to a TDigest", ErrInvalidInput, v)
 	}
@@ -183,6 +186,9 @@ func (t *TDigest) Quantile(q float64) (float64, error) {
 // Merge folds other into t. Both must have the same compression; a mismatch
 // returns an error wrapping ErrIncompatibleMerge.
 func (t *TDigest) Merge(other *TDigest) error {
+	if other == nil {
+		return fmt.Errorf("%w: cannot merge a nil TDigest", ErrInvalidInput)
+	}
 	if other.compression != t.compression {
 		return fmt.Errorf("%w: TDigest compressions %g and %g differ", ErrIncompatibleMerge, t.compression, other.compression)
 	}
@@ -300,6 +306,11 @@ func DecodeTDigest(data []byte) (*TDigest, error) {
 		cs = append(cs, centroid{mean, w})
 		total += w
 	}
+	if !r.atEnd() {
+		return nil, fmt.Errorf("%w: %d trailing bytes", ErrBadData, r.remaining())
+	}
+	t.merged = cs
+	t.totalWeight = total
 	if n > 0 {
 		if math.IsNaN(mn) || math.IsInf(mn, 0) || math.IsNaN(mx) || math.IsInf(mx, 0) || mn > mx {
 			return nil, fmt.Errorf("%w: min/max must be finite with min <= max", ErrBadData)
@@ -307,13 +318,13 @@ func DecodeTDigest(data []byte) (*TDigest, error) {
 		if cs[0].mean < mn || cs[len(cs)-1].mean > mx {
 			return nil, fmt.Errorf("%w: centroid means outside [min,max]", ErrBadData)
 		}
+		t.min = mn
+		t.max = mx
+	} else {
+		// An empty digest carries no real bounds; normalize to the empty sentinels so a
+		// forged min/max (NaN, Inf) cannot poison a later Add or Quantile.
+		t.min = math.Inf(1)
+		t.max = math.Inf(-1)
 	}
-	if !r.atEnd() {
-		return nil, fmt.Errorf("%w: %d trailing bytes", ErrBadData, r.remaining())
-	}
-	t.merged = cs
-	t.totalWeight = total
-	t.min = mn
-	t.max = mx
 	return t, nil
 }

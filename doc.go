@@ -4,12 +4,15 @@
 // structure carries a proven error guarantee the godoc states it in terms a test
 // can check; t-digest, which has no worst-case guarantee, says so plainly.
 //
-// All constructors validate their parameters and return an error rather than
-// panic, and no method panics on any input. The estimators reject a non-finite
-// numeric input with an error wrapping ErrInvalidInput. Decoders treat every byte
-// as untrusted: an unknown version, an out-of-range parameter, or a declared size
-// that the parameters cannot justify is rejected with an error, never a panic or
-// an unbounded allocation.
+// All constructors validate their parameters and return an error rather than panic.
+// On a summary built by a constructor no method panics on any input: a non-finite
+// numeric input, an empty summary, a nil argument to Merge, and a parameter out of
+// range are each reported with an error (wrapping ErrInvalidInput, ErrEmpty,
+// ErrIncompatibleMerge or ErrInvalidParam). The zero value of a summary type is not
+// usable; always create one through its constructor. Decoders treat every byte as
+// untrusted: an unknown version, an out-of-range parameter, or a declared size that
+// the parameters cannot justify is rejected with an error, never a panic or an
+// unbounded allocation.
 //
 // The summaries are not safe for concurrent use; synchronize externally.
 //

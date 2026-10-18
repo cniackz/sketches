@@ -244,6 +244,21 @@ func TestTDigestDecodeRejectsBadMinMax(t *testing.T) {
 			t.Fatalf("%s: decode should reject a non-finite min/max with centroids present", tc.name)
 		}
 	}
+	// An empty digest with a forged NaN min is accepted but normalized, so a later Add
+	// and Quantile are not poisoned.
+	empty, _ := NewTDigest(100)
+	ee := empty.Encode()
+	binary.LittleEndian.PutUint64(ee[minOff:], math.Float64bits(math.NaN()))
+	ed, err := DecodeTDigest(ee)
+	if err != nil {
+		t.Fatalf("empty digest with forged min should decode (normalized): %v", err)
+	}
+	if err := ed.Add(5); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := ed.Quantile(0); err != nil || math.IsNaN(v) {
+		t.Fatalf("Quantile(0) after Add is %g (err %v); forged min leaked", v, err)
+	}
 }
 
 // TestTDigestQuantileNoOverflow is posterior T5 (found by the decode fuzz): a decoded

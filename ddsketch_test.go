@@ -66,7 +66,9 @@ func checkBound(t *testing.T, s *DDSketch, data []float64, alpha float64, tag st
 				}
 				continue
 			}
-			if math.Abs(got-xq) <= alpha*math.Abs(xq)+1e-9 {
+			// Relative slack only (a tiny multiple of the bound for float rounding); an
+			// absolute floor would hide failures at small magnitudes.
+			if math.Abs(got-xq) <= alpha*math.Abs(xq)*(1+1e-9) {
 				ok = true
 			}
 		}
@@ -201,33 +203,36 @@ func TestDDSketchInvalidInput(t *testing.T) {
 }
 
 // TestDDSketchExtremeMagnitude is posterior D1: a magnitude so large that its bucket
-// boundary overflows float64 used to make Quantile return +Inf. Add now rejects it
-// (the guarantee cannot hold there), and a value just inside the range is accepted
-// and returns a finite quantile.
+// boundary overflows float64 used to make Quantile return +Inf. Add now rejects only
+// that overflow case (near MaxFloat64); the whole subnormal range stays usable and a
+// large representable magnitude returns a finite quantile within alpha.
 func TestDDSketchExtremeMagnitude(t *testing.T) {
 	s, _ := NewDDSketch(0.01)
-	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, -math.SmallestNonzeroFloat64} {
+	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64} {
 		if err := s.Add(v); err == nil {
-			t.Fatalf("Add(%g) should be rejected as out of representable range", v)
+			t.Fatalf("Add(%g) should be rejected: its bucket boundary overflows", v)
 		}
 	}
 	if s.Count() != 0 {
 		t.Fatal("rejected extreme adds should not change the sketch")
 	}
-	// A large but representable magnitude is accepted and its quantile stays finite.
-	big := 1e300
-	if err := s.Add(big); err != nil {
-		t.Fatalf("Add(%g) should be accepted: %v", big, err)
-	}
-	got, err := s.Quantile(0.5)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if math.IsInf(got, 0) || math.IsNaN(got) {
-		t.Fatalf("Quantile returned %g for a representable value", got)
-	}
-	if math.Abs(got-big) > 0.01*big {
-		t.Fatalf("Quantile %g not within alpha of %g", got, big)
+	// Subnormals and a large representable magnitude are accepted with finite,
+	// in-bound quantiles.
+	for _, v := range []float64{math.SmallestNonzeroFloat64, 1e-320, 1e300} {
+		s2, _ := NewDDSketch(0.01)
+		if err := s2.Add(v); err != nil {
+			t.Fatalf("Add(%g) should be accepted: %v", v, err)
+		}
+		got, err := s2.Quantile(0.5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.IsInf(got, 0) || math.IsNaN(got) {
+			t.Fatalf("Quantile returned %g for representable value %g", got, v)
+		}
+		if math.Abs(got-v) > 0.01*math.Abs(v) {
+			t.Fatalf("Quantile %g not within alpha of %g", got, v)
+		}
 	}
 	// A crafted encoding with an out-of-range bucket index is rejected by decode.
 	s2, _ := NewDDSketch(0.01)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/bits"
 )
 
 // cmMaxCells caps w*d so a constructor or a decoder cannot be asked to allocate an
@@ -15,9 +16,10 @@ const cmMaxCells = 1 << 28
 // and never underestimates. With width w and depth d it guarantees, for every key
 // x, f(x) <= Estimate(x) <= f(x) + epsilon*N with probability at least 1-delta,
 // where N is the total weight added and epsilon, delta are the parameters given to
-// NewCountMin. The d rows use one base hash and a deterministic double-hashing
-// derivation (row r uses h1 + r*h2), so no per-row seed is stored and a decoded
-// sketch uses the same hash family. Not safe for concurrent use.
+// NewCountMin. Each of the d rows derives an independent column by running the fixed
+// mixer over the key's base hash combined with a distinct per-row constant, so no
+// per-row seed is stored and a decoded sketch uses the same hash family. Not safe for
+// concurrent use.
 type CountMin struct {
 	w, d    uint32
 	epsilon float64
@@ -69,26 +71,44 @@ func (c *CountMin) Depth() int { return int(c.d) }
 // Total is the sum of all weights added.
 func (c *CountMin) Total() uint64 { return c.total }
 
+// cols returns, for a key's base hash, the column it falls in on each of the d rows.
+// Each row runs the fixed mixer over the base XOR a distinct per-row constant, so the
+// rows are independent. An earlier double-hashing scheme (h1 + r*h2) shared h1 and h2
+// across every row, which made two keys collide in ALL d rows with probability about
+// 1/w^2 instead of 1/w^d, and broke the 1-delta bound when w was small and d large.
+// The per-row constants are derived from r, not stored, so a decoded sketch uses the
+// same hash family.
 func (c *CountMin) cols(base uint64) func(r uint32) uint32 {
-	h1 := base
-	h2 := mix64(base) | 1
 	return func(r uint32) uint32 {
-		return uint32((h1 + uint64(r)*h2) % uint64(c.w))
+		h := mix64(base ^ ((uint64(r) + 1) * 0x9e3779b97f4a7c15))
+		return uint32(h % uint64(c.w))
 	}
 }
 
+// satAdd64 adds two counts, saturating at the maximum rather than wrapping, so a count
+// large enough to overflow uint64 cannot make an estimate fall below the true count.
+func satAdd64(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+	return a + b
+}
+
 // AddHash adds weight count to the key identified by the precomputed hash base. It
-// is the hash door for callers who bring their own 64-bit hash; Add hashes the key
-// with the package's fixed mixer. A count of zero is a no-op.
+// is the hash door for callers who bring their own 64-bit hash, which should be
+// well distributed (the mixer is applied per row, but a base with little entropy
+// gives correlated rows); Add hashes the key with the package's fixed mixer. A count
+// of zero, or a call on a zero-value sketch, is a no-op.
 func (c *CountMin) AddHash(base uint64, count uint64) {
-	if count == 0 {
+	if count == 0 || c.w == 0 {
 		return
 	}
 	col := c.cols(base)
 	for r := uint32(0); r < c.d; r++ {
-		c.counts[r*c.w+col(r)] += count
+		i := r*c.w + col(r)
+		c.counts[i] = satAdd64(c.counts[i], count)
 	}
-	c.total += count
+	c.total = satAdd64(c.total, count)
 }
 
 // Add adds weight count to key. A count of zero is a no-op.
@@ -96,6 +116,9 @@ func (c *CountMin) Add(key []byte, count uint64) { c.AddHash(hashBytes(key), cou
 
 // EstimateHash returns the estimated frequency of the key identified by base.
 func (c *CountMin) EstimateHash(base uint64) uint64 {
+	if c.w == 0 {
+		return 0
+	}
 	col := c.cols(base)
 	var est uint64
 	for r := uint32(0); r < c.d; r++ {
@@ -114,13 +137,16 @@ func (c *CountMin) Estimate(key []byte) uint64 { return c.EstimateHash(hashBytes
 // Merge adds other into c. The two sketches must have the same parameters; a
 // mismatch returns an error wrapping ErrIncompatibleMerge.
 func (c *CountMin) Merge(other *CountMin) error {
+	if other == nil {
+		return fmt.Errorf("%w: cannot merge a nil count-min sketch", ErrInvalidInput)
+	}
 	if other.w != c.w || other.d != c.d {
 		return fmt.Errorf("%w: count-min shapes %dx%d and %dx%d differ", ErrIncompatibleMerge, c.d, c.w, other.d, other.w)
 	}
 	for i := range c.counts {
-		c.counts[i] += other.counts[i]
+		c.counts[i] = satAdd64(c.counts[i], other.counts[i])
 	}
-	c.total += other.total
+	c.total = satAdd64(c.total, other.total)
 	return nil
 }
 
@@ -200,6 +226,20 @@ func DecodeCountMin(data []byte) (*CountMin, error) {
 	c.total = total
 	if !r.atEnd() {
 		return nil, fmt.Errorf("%w: %d trailing bytes", ErrBadData, r.remaining())
+	}
+	// Every add touches exactly one cell per row, so each row must sum to the total.
+	// A row that does not is a forged or corrupt sketch and is rejected.
+	for rw := uint32(0); rw < d; rw++ {
+		var rowSum, carry uint64
+		for j := uint32(0); j < w; j++ {
+			rowSum, carry = bits.Add64(rowSum, c.counts[rw*w+j], 0)
+			if carry != 0 {
+				return nil, fmt.Errorf("%w: count-min row %d sum overflows", ErrBadData, rw)
+			}
+		}
+		if rowSum != total {
+			return nil, fmt.Errorf("%w: count-min row %d sums to %d, stored total %d", ErrBadData, rw, rowSum, total)
+		}
 	}
 	return c, nil
 }
