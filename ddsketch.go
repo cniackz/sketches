@@ -13,10 +13,11 @@ import (
 // alpha relative error of the true q-quantile of the data: |Quantile(q) - x_q| <=
 // alpha*|x_q|. An alpha below 1e-9 is rejected because float64 cannot honor it. It
 // handles finite reals through a logarithmic bucketing of the magnitude, with a
-// mirror store for negatives and a separate counter for zero; the whole subnormal
-// range is supported, but a magnitude so large that its bucket boundary would
-// overflow float64 (near MaxFloat64) is rejected by Add, since the representative
-// value could not be formed there.
+// mirror store for negatives and a separate counter for zero. The supported magnitude
+// range is the normal float64 range: zero, and magnitudes from about 2.2e-308 up to
+// near MaxFloat64. A subnormal magnitude (below about 2.2e-308) or one within a bucket
+// of MaxFloat64 is rejected by Add, because its bucket representative would be
+// subnormal or overflow and so could not honor the relative-error bound.
 // Memory grows with the logarithm of the data range, not with the count. An
 // optional bucket cap (off by default) bounds memory by collapsing the
 // lowest-magnitude buckets, which relaxes the guarantee for those values only.
@@ -62,18 +63,23 @@ func newDD(alpha float64, maxBuckets int) (*DDSketch, error) {
 		neg:        map[int]uint64{},
 		maxBuckets: maxBuckets,
 	}
-	// Precompute the index range whose representative value stays finite and nonzero.
-	// Above it the value overflows toward +Inf (near MaxFloat64), so Add and decode
-	// reject it; below it the value would underflow to 0, but no representable positive
-	// float maps there, so the whole subnormal range stays usable. The bound is a
-	// one-time O(1) compare per Add, not a per-Add Exp.
-	lnVmul := math.Log(s.vmul)
-	s.maxIdx = int(math.Floor((math.Log(math.MaxFloat64) - lnVmul) / s.logGamma))
-	s.minIdx = int(math.Ceil((math.Log(math.SmallestNonzeroFloat64) - lnVmul) / s.logGamma))
+	// Precompute the index range whose representative value is a normal float64, so it
+	// carries full 52-bit precision and the relative-error guarantee holds on every
+	// architecture. A representative above MaxFloat64 overflows to +Inf; one below the
+	// smallest normal (about 2.2e-308) falls into the subnormals, where the mantissa
+	// loses bits and the round trip is no longer within alpha (on amd64 the smallest
+	// subnormal maps to about 1.1e-308, far outside the bound). Magnitudes mapping
+	// outside this range are rejected by Add and decode. The ends come from index()
+	// applied to the boundary floats (the same function Add uses, so acceptance is
+	// self-consistent across architectures) and are then tightened by the actual value.
+	// The check is a one-time O(1) integer compare per Add, not a per-Add Exp.
+	const minNormal = 0x1p-1022 // smallest positive normal float64
+	s.minIdx = s.index(minNormal)
+	s.maxIdx = s.index(math.MaxFloat64)
 	for s.maxIdx > s.minIdx && math.IsInf(s.value(s.maxIdx), 0) {
 		s.maxIdx--
 	}
-	for s.minIdx < s.maxIdx && s.value(s.minIdx) == 0 {
+	for s.minIdx < s.maxIdx && s.value(s.minIdx) < minNormal {
 		s.minIdx++
 	}
 	return s, nil
@@ -115,9 +121,10 @@ func (s *DDSketch) index(magnitude float64) int {
 
 func (s *DDSketch) value(i int) float64 { return math.Exp(float64(i)*s.logGamma) * s.vmul }
 
-// Add records a value. A NaN or infinite value, or a finite value whose magnitude is
-// so large (near MaxFloat64) that its bucket boundary would overflow float64, is
-// rejected with an error wrapping ErrInvalidInput and leaves the sketch unchanged.
+// Add records a value. Zero is always accepted. A NaN or infinite value, or a finite
+// value whose magnitude is subnormal (below about 2.2e-308) or within a bucket of
+// MaxFloat64, is rejected with an error wrapping ErrInvalidInput and leaves the sketch
+// unchanged, because its bucket representative could not honor the relative-error bound.
 func (s *DDSketch) Add(v float64) error {
 	if s.pos == nil {
 		return fmt.Errorf("%w: use NewDDSketch to create a DDSketch", ErrInvalidInput)

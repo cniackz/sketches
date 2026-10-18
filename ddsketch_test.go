@@ -202,23 +202,23 @@ func TestDDSketchInvalidInput(t *testing.T) {
 	}
 }
 
-// TestDDSketchExtremeMagnitude is posterior D1: a magnitude so large that its bucket
-// boundary overflows float64 used to make Quantile return +Inf. Add now rejects only
-// that overflow case (near MaxFloat64); the whole subnormal range stays usable and a
-// large representable magnitude returns a finite quantile within alpha.
+// TestDDSketchExtremeMagnitude is posterior D1: a magnitude outside the normal float64
+// range has a bucket representative that overflows (near MaxFloat64) or is subnormal
+// (below about 2.2e-308), neither of which can honor the relative-error bound. Add
+// rejects those; magnitudes in the normal range return a finite, in-bound quantile.
 func TestDDSketchExtremeMagnitude(t *testing.T) {
 	s, _ := NewDDSketch(0.01)
-	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64} {
+	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, 1e-320, -1e-320} {
 		if err := s.Add(v); err == nil {
-			t.Fatalf("Add(%g) should be rejected: its bucket boundary overflows", v)
+			t.Fatalf("Add(%g) should be rejected: representative outside the normal range", v)
 		}
 	}
 	if s.Count() != 0 {
 		t.Fatal("rejected extreme adds should not change the sketch")
 	}
-	// Subnormals and a large representable magnitude are accepted with finite,
-	// in-bound quantiles.
-	for _, v := range []float64{math.SmallestNonzeroFloat64, 1e-320, 1e300} {
+	// Magnitudes in the normal range (down to the smallest normal) are accepted with
+	// finite, in-bound quantiles.
+	for _, v := range []float64{0x1p-1022, 1e-300, 1e300} {
 		s2, _ := NewDDSketch(0.01)
 		if err := s2.Add(v); err != nil {
 			t.Fatalf("Add(%g) should be accepted: %v", v, err)
