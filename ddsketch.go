@@ -11,12 +11,14 @@ import (
 // DDSketch is a quantile sketch with a relative-error guarantee. For a relative
 // accuracy alpha in [1e-9, 1), every value it returns for a quantile q is within
 // alpha relative error of the true q-quantile of the data: |Quantile(q) - x_q| <=
-// alpha*|x_q|. An alpha below 1e-9 is rejected because float64 cannot honor it. It
-// handles finite reals through a logarithmic bucketing of the magnitude, with a
-// mirror store for negatives and a separate counter for zero. The supported magnitude
-// range is the normal float64 range: zero, and magnitudes from about 2.2e-308 up to
-// near MaxFloat64. A subnormal magnitude (below about 2.2e-308) or one within a bucket
-// of MaxFloat64 is rejected by Add, because its bucket representative would be
+// alpha*|x_q|, up to float64 rounding at the exact bucket boundary. An alpha below 1e-9
+// is rejected because float64 cannot honor it. It handles finite reals through a
+// logarithmic bucketing of the magnitude, with a mirror store for negatives and a
+// separate counter for zero. The supported magnitude range is zero and the normal
+// float64 range up to a portable ceiling: magnitudes from about 2.2e-308 up to about
+// 8e307. A subnormal magnitude (below about 2.2e-308) or one above the ceiling (which is
+// an exponent margin below MaxFloat64, so the bucket representative stays a finite normal
+// float on every architecture) is rejected by Add, because its representative would be
 // subnormal or overflow and so could not honor the relative-error bound.
 // Memory grows with the logarithm of the data range, not with the count. An
 // optional bucket cap (off by default) bounds memory by collapsing the
@@ -65,20 +67,27 @@ func newDD(alpha float64, maxBuckets int) (*DDSketch, error) {
 	}
 	// Precompute the index range whose representative value is a normal float64, so it
 	// carries full 52-bit precision and the relative-error guarantee holds on every
-	// architecture. A representative above MaxFloat64 overflows to +Inf; one below the
-	// smallest normal (about 2.2e-308) falls into the subnormals, where the mantissa
-	// loses bits and the round trip is no longer within alpha (on amd64 the smallest
-	// subnormal maps to about 1.1e-308, far outside the bound). Magnitudes mapping
-	// outside this range are rejected by Add and decode. The ends come from index()
-	// applied to the boundary floats (the same function Add uses, so acceptance is
-	// self-consistent across architectures) and are then tightened by the actual value.
-	// The check is a one-time O(1) integer compare per Add, not a per-Add Exp.
+	// architecture. value(i) = exp(i*logGamma)*vmul: a representative is rejected when it
+	// would overflow to +Inf at the top or fall into the subnormals at the bottom (below
+	// about 2.2e-308), where the mantissa loses bits and the round trip is no longer
+	// within alpha. Magnitudes mapping outside [minIdx, maxIdx] are rejected by Add and
+	// decode, as a one-time O(1) integer compare per Add.
+	//
+	// The top is a fixed portable exponent ceiling, not a search for where Exp overflows.
+	// math.Exp returns +Inf at an argument that differs by architecture (about 709.44 on
+	// amd64, 709.78 on arm64), so a scan down from index(MaxFloat64) both diverged across
+	// architectures and, at alpha=1e-9, ran about 173M iterations on amd64. Capping the
+	// exponent at ddMaxExp (below the lower overflow threshold) keeps value(maxIdx) finite
+	// everywhere and the bound O(1). It costs an exponent margin at the very top: the
+	// largest representable magnitude is about 8e307, somewhat below MaxFloat64.
+	//
+	// The bottom stays a short value()-based step (at most one iteration, and far from any
+	// Exp cliff), so acceptance of the smallest normal magnitudes is self-consistent with
+	// what value() actually produces on each architecture.
 	const minNormal = 0x1p-1022 // smallest positive normal float64
+	const ddMaxExp = 709.0      // exp-argument ceiling below any architecture's overflow point
+	s.maxIdx = int(math.Floor(ddMaxExp / s.logGamma))
 	s.minIdx = s.index(minNormal)
-	s.maxIdx = s.index(math.MaxFloat64)
-	for s.maxIdx > s.minIdx && math.IsInf(s.value(s.maxIdx), 0) {
-		s.maxIdx--
-	}
 	for s.minIdx < s.maxIdx && s.value(s.minIdx) < minNormal {
 		s.minIdx++
 	}
@@ -122,9 +131,9 @@ func (s *DDSketch) index(magnitude float64) int {
 func (s *DDSketch) value(i int) float64 { return math.Exp(float64(i)*s.logGamma) * s.vmul }
 
 // Add records a value. Zero is always accepted. A NaN or infinite value, or a finite
-// value whose magnitude is subnormal (below about 2.2e-308) or within a bucket of
-// MaxFloat64, is rejected with an error wrapping ErrInvalidInput and leaves the sketch
-// unchanged, because its bucket representative could not honor the relative-error bound.
+// value whose magnitude is subnormal (below about 2.2e-308) or above about 8e307, is
+// rejected with an error wrapping ErrInvalidInput and leaves the sketch unchanged,
+// because its bucket representative could not honor the relative-error bound.
 func (s *DDSketch) Add(v float64) error {
 	if s.pos == nil {
 		return fmt.Errorf("%w: use NewDDSketch to create a DDSketch", ErrInvalidInput)

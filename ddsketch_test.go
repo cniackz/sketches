@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
+	"time"
 )
 
 func ddDataset(rng *rand.Rand, kind string, n int) []float64 {
@@ -289,6 +290,47 @@ func TestDDSketchHugeCountQuantile(t *testing.T) {
 	}
 	if _, err := dec.Quantile(1); err != nil {
 		t.Fatalf("decoded Quantile(1): %v", err)
+	}
+}
+
+// TestDDSketchPortableTop is posterior R2-J: the top of the representable range used to
+// come from a scan for where math.Exp overflows, which happens at a different argument on
+// amd64 (about 709.44) than on arm64 (about 709.78), so Add and decode accepted different
+// magnitudes on the two architectures (1.5e308 passed on arm64 and failed on amd64). The
+// top is now a fixed exponent ceiling, identical everywhere, and the representative at
+// maxIdx is finite.
+func TestDDSketchPortableTop(t *testing.T) {
+	s, _ := NewDDSketch(ddMinAlpha) // the finest alpha, where the amd64 scan diverged and hung
+	if v := s.value(s.maxIdx); math.IsInf(v, 0) || math.IsNaN(v) {
+		t.Fatalf("representative at maxIdx is %g, must be finite on every architecture", v)
+	}
+	if s.representable(s.maxIdx + 1) {
+		t.Fatal("maxIdx+1 must not be representable")
+	}
+	// A magnitude above the ceiling is rejected and one below is accepted, the same on
+	// every architecture (the boundary is an integer index, not an Exp overflow point).
+	if err := s.Add(1e308); err == nil {
+		t.Fatal("1e308 is above the portable ceiling and should be rejected")
+	}
+	if err := s.Add(1e307); err != nil {
+		t.Fatalf("1e307 is below the ceiling and should be accepted: %v", err)
+	}
+}
+
+// TestDDSketchConstructionConstantTime is posterior R2-I: NewDDSketch (and so
+// DecodeDDSketch) scanned maxIdx down one index at a time while the representative
+// overflowed, which on amd64 was about 173M Exp calls at alpha=1e-9, around 2 s per
+// construction. The bound is now O(1); constructing the finest alpha repeatedly must stay
+// far under that.
+func TestDDSketchConstructionConstantTime(t *testing.T) {
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		if _, err := NewDDSketch(ddMinAlpha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("20 constructions at alpha=%g took %v; the O(1/alpha) scan is back", ddMinAlpha, d)
 	}
 }
 

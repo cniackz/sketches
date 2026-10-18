@@ -17,16 +17,19 @@ parameters do not justify.
 
 | Structure | Guarantee | Parameter |
 |---|---|---|
-| DDSketch | `Quantile(q)` within `alpha` relative error of the true `x_q`, for zero and every value whose magnitude is in the normal float64 range | relative accuracy `alpha` in `[1e-9, 1)` |
+| DDSketch | `Quantile(q)` within `alpha` relative error of the true `x_q` (up to float64 rounding at the bucket boundary), for zero and every value from about `2.2e-308` to about `8e307` | relative accuracy `alpha` in `[1e-9, 1)` |
 | HyperLogLog | relative standard error about `1.04/sqrt(m)`, `m = 2^p` (statistical, not per-estimate; see the transition-band note below) | precision `p` |
 | count-min | `f(x) <= Estimate(x) <= f(x) + epsilon*N` with probability `>= 1-delta`, never under | `epsilon`, `delta` |
 | t-digest | none in the worst case; empirically accurate, finest resolution in the tails | `compression` |
 
 `DDSketch` rejects an `alpha` below `1e-9` (float64 cannot honor a finer relative
-error) and rejects a value whose magnitude is outside the normal float64 range: a
-subnormal magnitude (below about `2.2e-308`) or one within a bucket of `MaxFloat64`,
-whose bucket representative would be subnormal or overflow and so could not honor the
-bound. Zero is always accepted. `HyperLogLog`, because it omits the HLL++
+error) and rejects a value whose magnitude is outside its supported range: a subnormal
+magnitude (below about `2.2e-308`) or one above about `8e307`, whose bucket
+representative would be subnormal or overflow and so could not honor the bound. The
+upper ceiling is a fixed exponent margin below `MaxFloat64`, so the accept/reject
+boundary and a decoded sketch are identical on every architecture (`math.Exp` overflows
+at a slightly different argument on amd64 than on arm64). Zero is always accepted.
+`HyperLogLog`, because it omits the HLL++
 bias-correction tables, is positively biased by up to a few percent in a narrow
 transition band just above where linear counting hands off to the raw estimate (about
 `2.5*m` to `3*m` distinct items, measured about +2.4% at `p=14`); outside that band the
