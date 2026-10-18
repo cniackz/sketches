@@ -246,6 +246,37 @@ func TestTDigestDecodeRejectsBadMinMax(t *testing.T) {
 	}
 }
 
+// TestTDigestQuantileNoOverflow is posterior T5 (found by the decode fuzz): a decoded
+// digest can legitimately carry an extreme min and a centroid with a huge weight, and
+// interpolation used to overflow to +Inf (the product (y1-y0)*(x-x0) exceeded
+// float64). Quantile must stay finite and monotone on any valid digest.
+func TestTDigestQuantileNoOverflow(t *testing.T) {
+	td, _ := NewTDigest(100)
+	td.merged = []centroid{
+		{mean: 1e-76, weight: 6e116},
+		{mean: 1e-70, weight: 1},
+		{mean: 1e-67, weight: 1},
+	}
+	td.totalWeight = 6e116 + 2
+	td.min = -4e304
+	td.max = 1e-67
+	prev := math.Inf(-1)
+	for i := 0; i <= 20; i++ {
+		q := float64(i) / 20
+		v, err := td.Quantile(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			t.Fatalf("q=%g returned %g", q, v)
+		}
+		if v < prev-1e-6 {
+			t.Fatalf("q=%g not monotone: %g < %g", q, v, prev)
+		}
+		prev = v
+	}
+}
+
 func TestTDigestDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},

@@ -1,6 +1,9 @@
 package sketches
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // The decode fuzz targets feed arbitrary bytes to each decoder and require that it
 // never panics and never allocates without bound. When a decode succeeds, the
@@ -90,7 +93,9 @@ func FuzzDecodeTDigest(f *testing.F) {
 			t.Fatalf("round trip unstable")
 		}
 		if got.totalWeight > 0 {
-			prev := -1e308
+			// Start below any representable value: a validly decoded digest may have a
+			// min more negative than any fixed sentinel, and Quantile(0) returns it.
+			prev := math.Inf(-1)
 			for q := 0.0; q <= 1; q += 0.1 {
 				v, _ := got.Quantile(q)
 				if v < prev-1e-6 {

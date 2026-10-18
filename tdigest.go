@@ -131,11 +131,17 @@ func (t *TDigest) NumCentroids() int {
 	return len(t.merged)
 }
 
+// lerp interpolates linearly as a convex combination, y0*(1-u) + y1*u with u in
+// [0,1], rather than y0 + (y1-y0)*(x-x0)/(x1-x0). The convex form keeps each term
+// bounded by |y0| or |y1|, so with finite endpoints the result is always finite and
+// within [min(y0,y1), max(y0,y1)]; the subtractive form could overflow to Inf for a
+// decoded digest with an extreme min or max and a huge centroid weight.
 func lerp(x0, y0, x1, y1, x float64) float64 {
 	if x1 == x0 {
-		return (y0 + y1) / 2
+		return y0/2 + y1/2
 	}
-	return y0 + (y1-y0)*(x-x0)/(x1-x0)
+	u := (x - x0) / (x1 - x0)
+	return y0*(1-u) + y1*u
 }
 
 // Quantile returns the estimated value at quantile q in [0,1]. It returns an error
