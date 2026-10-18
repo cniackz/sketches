@@ -2,6 +2,7 @@ package sketches
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"sort"
@@ -184,6 +185,63 @@ func TestTDigestInvalidInput(t *testing.T) {
 	for _, comp := range []float64{0, 1, -5, math.Inf(1), math.NaN()} {
 		if _, err := NewTDigest(comp); err == nil {
 			t.Fatalf("NewTDigest(%g) should fail", comp)
+		}
+	}
+}
+
+// TestTDigestWeightOverflow is posterior T1: weights that sum past the float64 range
+// used to make the total weight +Inf, which poisoned the scale function into NaN
+// quantiles with no error. Add and Merge now reject the overflow and the digest stays
+// usable.
+func TestTDigestWeightOverflow(t *testing.T) {
+	td, _ := NewTDigest(100)
+	if err := td.AddWeighted(1, 1e308); err != nil {
+		t.Fatalf("first 1e308 weight should be accepted: %v", err)
+	}
+	if err := td.AddWeighted(2, 1e308); err == nil {
+		t.Fatal("a second 1e308 weight should be rejected as overflow")
+	}
+	q, err := td.Quantile(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.IsNaN(q) || math.IsInf(q, 0) {
+		t.Fatalf("Quantile returned %g after a rejected overflow", q)
+	}
+	a, _ := NewTDigest(100)
+	b, _ := NewTDigest(100)
+	a.AddWeighted(1, 1e308)
+	b.AddWeighted(2, 1e308)
+	if err := a.Merge(b); err == nil {
+		t.Fatal("a merge that overflows the total weight should be rejected")
+	}
+}
+
+// TestTDigestDecodeRejectsBadMinMax is posterior T2: a decoded digest with centroids
+// but a non-finite min or max used to be accepted and made Quantile return Inf. Decode
+// now requires finite min and max when centroids are present.
+func TestTDigestDecodeRejectsBadMinMax(t *testing.T) {
+	td, _ := NewTDigest(100)
+	for i := 0; i < 100; i++ {
+		td.Add(float64(i))
+	}
+	enc := td.Encode()
+	// Layout: magic(2) + version(1) + compression(8) + min(8) + max(8) + ...
+	minOff, maxOff := 3+8, 3+8+8
+	for _, tc := range []struct {
+		name string
+		off  int
+		val  float64
+	}{
+		{"max=+Inf", maxOff, math.Inf(1)},
+		{"min=-Inf", minOff, math.Inf(-1)},
+		{"max=NaN", maxOff, math.NaN()},
+		{"min=NaN", minOff, math.NaN()},
+	} {
+		b := append([]byte(nil), enc...)
+		binary.LittleEndian.PutUint64(b[tc.off:], math.Float64bits(tc.val))
+		if _, err := DecodeTDigest(b); err == nil {
+			t.Fatalf("%s: decode should reject a non-finite min/max with centroids present", tc.name)
 		}
 	}
 }

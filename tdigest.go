@@ -20,6 +20,7 @@ type TDigest struct {
 	buffer      []centroid
 	bufferLimit int
 	totalWeight float64
+	bufWeight   float64 // weight held in buffer, kept current so Count and the overflow guard are O(1)
 	min, max    float64
 }
 
@@ -44,7 +45,10 @@ func NewTDigest(compression float64) (*TDigest, error) {
 // ErrInvalidInput and leaves the digest unchanged.
 func (t *TDigest) Add(v float64) error { return t.AddWeighted(v, 1) }
 
-// AddWeighted records value v with weight w (w > 0).
+// AddWeighted records value v with weight w (w > 0). A NaN or infinite v, a
+// non-positive or non-finite w, or a w that would make the running total weight
+// overflow to infinity is rejected with an error wrapping ErrInvalidInput and leaves
+// the digest unchanged.
 func (t *TDigest) AddWeighted(v, w float64) error {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return fmt.Errorf("%w: cannot add %g to a TDigest", ErrInvalidInput, v)
@@ -52,7 +56,11 @@ func (t *TDigest) AddWeighted(v, w float64) error {
 	if !(w > 0) || math.IsInf(w, 0) || math.IsNaN(w) {
 		return fmt.Errorf("%w: weight must be a positive finite number, got %g", ErrInvalidInput, w)
 	}
+	if math.IsInf(t.totalWeight+t.bufWeight+w, 0) {
+		return fmt.Errorf("%w: adding weight %g would overflow the total weight", ErrInvalidInput, w)
+	}
 	t.buffer = append(t.buffer, centroid{v, w})
+	t.bufWeight += w
 	if v < t.min {
 		t.min = v
 	}
@@ -86,6 +94,7 @@ func (t *TDigest) compress() {
 	}
 	all := append(t.merged, t.buffer...)
 	t.buffer = t.buffer[:0]
+	t.bufWeight = 0
 	sort.Slice(all, func(i, j int) bool { return all[i].mean < all[j].mean })
 	var total float64
 	for _, c := range all {
@@ -116,18 +125,10 @@ func (t *TDigest) compress() {
 // Compression, Count and NumCentroids report the configured compression, the total
 // weight, and the number of stored centroids.
 func (t *TDigest) Compression() float64 { return t.compression }
-func (t *TDigest) Count() float64       { return t.totalWeight + t.bufferedWeight() }
+func (t *TDigest) Count() float64       { return t.totalWeight + t.bufWeight }
 func (t *TDigest) NumCentroids() int {
 	t.compress()
 	return len(t.merged)
-}
-
-func (t *TDigest) bufferedWeight() float64 {
-	var w float64
-	for _, c := range t.buffer {
-		w += c.weight
-	}
-	return w
 }
 
 func lerp(x0, y0, x1, y1, x float64) float64 {
@@ -179,8 +180,12 @@ func (t *TDigest) Merge(other *TDigest) error {
 	if other.compression != t.compression {
 		return fmt.Errorf("%w: TDigest compressions %g and %g differ", ErrIncompatibleMerge, t.compression, other.compression)
 	}
+	if math.IsInf(t.Count()+other.Count(), 0) {
+		return fmt.Errorf("%w: merging would overflow the total weight", ErrInvalidInput)
+	}
 	t.buffer = append(t.buffer, other.merged...)
 	t.buffer = append(t.buffer, other.buffer...)
+	t.bufWeight += other.Count()
 	if other.min < t.min {
 		t.min = other.min
 	}
@@ -290,8 +295,8 @@ func DecodeTDigest(data []byte) (*TDigest, error) {
 		total += w
 	}
 	if n > 0 {
-		if math.IsNaN(mn) || math.IsNaN(mx) || mn > mx {
-			return nil, fmt.Errorf("%w: bad min/max", ErrBadData)
+		if math.IsNaN(mn) || math.IsInf(mn, 0) || math.IsNaN(mx) || math.IsInf(mx, 0) || mn > mx {
+			return nil, fmt.Errorf("%w: min/max must be finite with min <= max", ErrBadData)
 		}
 		if cs[0].mean < mn || cs[len(cs)-1].mean > mx {
 			return nil, fmt.Errorf("%w: centroid means outside [min,max]", ErrBadData)

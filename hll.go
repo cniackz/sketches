@@ -23,6 +23,15 @@ const (
 // Gandon and Meunier 2007 and Heule, Nunkesser and Hall 2013; the empirical
 // bias-correction tables of HLL++ are not reproduced, linear counting covers the
 // small-cardinality regime instead.
+//
+// Because those bias-correction tables are omitted, there is one place where the
+// mean error rises above 1.04/sqrt(m): the transition band just above where linear
+// counting hands off to the raw estimate, roughly 2.5*m to 3*m distinct items, where
+// the raw HyperLogLog estimate is positively biased by up to a few percent (measured
+// about +2.4% at p=14, n=2.5*m). This is a known limit of the raw estimator, not a
+// bug; outside that band the error returns to about 1.04/sqrt(m). Reproducing the
+// HLL++ bias tables, or switching to Ertl's maximum-likelihood estimator, would close
+// the gap; both are out of scope for this version.
 type HLL struct {
 	p         uint8
 	m         uint32

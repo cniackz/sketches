@@ -8,10 +8,13 @@ import (
 )
 
 // DDSketch is a quantile sketch with a relative-error guarantee. For a relative
-// accuracy alpha in (0,1), every value it returns for a quantile q is within alpha
-// relative error of the true q-quantile of the data: |Quantile(q) - x_q| <=
-// alpha*|x_q|. It handles all finite reals through a logarithmic bucketing of the
-// magnitude, with a mirror store for negatives and a separate counter for zero.
+// accuracy alpha in [1e-9, 1), every value it returns for a quantile q is within
+// alpha relative error of the true q-quantile of the data: |Quantile(q) - x_q| <=
+// alpha*|x_q|. An alpha below 1e-9 is rejected because float64 cannot honor it. It
+// handles finite reals through a logarithmic bucketing of the magnitude, with a
+// mirror store for negatives and a separate counter for zero; a magnitude so extreme
+// that its bucket boundary would overflow or underflow in float64 (near the ends of
+// the float64 range) is rejected by Add, since the guarantee cannot hold there.
 // Memory grows with the logarithm of the data range, not with the count. An
 // optional bucket cap (off by default) bounds memory by collapsing the
 // lowest-magnitude buckets, which relaxes the guarantee for those values only.
@@ -26,17 +29,29 @@ type DDSketch struct {
 	zeroCount  uint64
 	count      uint64
 	maxBuckets int // 0 means unbounded
+	minIdx     int // smallest bucket index whose value stays > 0
+	maxIdx     int // largest bucket index whose value stays finite
 }
+
+// ddMinAlpha is the smallest relative accuracy the float64 arithmetic can actually
+// honor. Below it, gamma = (1+alpha)/(1-alpha) is so close to 1 that log(gamma) and
+// the exp/log round trip lose more precision than alpha itself, so the relative-error
+// guarantee no longer holds. 1e-9 leaves about six orders of margin over the float64
+// epsilon and is far finer than any real use.
+const ddMinAlpha = 1e-9
 
 func newDD(alpha float64, maxBuckets int) (*DDSketch, error) {
 	if !(alpha > 0 && alpha < 1) || math.IsNaN(alpha) {
 		return nil, fmt.Errorf("%w: alpha must be in (0,1), got %g", ErrInvalidParam, alpha)
 	}
+	if alpha < ddMinAlpha {
+		return nil, fmt.Errorf("%w: alpha must be >= %g for the guarantee to hold, got %g", ErrInvalidParam, ddMinAlpha, alpha)
+	}
 	if maxBuckets < 0 {
 		return nil, fmt.Errorf("%w: maxBuckets must be >= 0, got %d", ErrInvalidParam, maxBuckets)
 	}
 	gamma := (1 + alpha) / (1 - alpha)
-	return &DDSketch{
+	s := &DDSketch{
 		alpha:      alpha,
 		gamma:      gamma,
 		logGamma:   math.Log(gamma),
@@ -44,8 +59,28 @@ func newDD(alpha float64, maxBuckets int) (*DDSketch, error) {
 		pos:        map[int]uint64{},
 		neg:        map[int]uint64{},
 		maxBuckets: maxBuckets,
-	}, nil
+	}
+	// Precompute the index range whose representative value stays in the normal
+	// float64 range. Above it the value overflows toward +Inf; below it the value
+	// falls into the subnormals, where relative precision degrades below alpha. In
+	// either case the relative-error guarantee cannot be honored, so Add and decode
+	// reject it. The bound is a one-time O(1) compare per Add, not a per-Add Exp.
+	const minNormal = 0x1p-1022 // smallest positive normal float64
+	lnVmul := math.Log(s.vmul)
+	s.maxIdx = int(math.Floor((math.Log(math.MaxFloat64) - lnVmul) / s.logGamma))
+	s.minIdx = int(math.Ceil((math.Log(minNormal) - lnVmul) / s.logGamma))
+	for s.maxIdx > s.minIdx && math.IsInf(s.value(s.maxIdx), 0) {
+		s.maxIdx--
+	}
+	for s.minIdx < s.maxIdx && s.value(s.minIdx) < minNormal {
+		s.minIdx++
+	}
+	return s, nil
 }
+
+// representable reports whether bucket index i maps to a finite, nonzero
+// representative value, so the relative-error guarantee can hold for it.
+func (s *DDSketch) representable(i int) bool { return i >= s.minIdx && i <= s.maxIdx }
 
 // NewDDSketch returns an unbounded sketch with relative accuracy alpha in (0,1).
 func NewDDSketch(alpha float64) (*DDSketch, error) { return newDD(alpha, 0) }
@@ -79,8 +114,10 @@ func (s *DDSketch) index(magnitude float64) int {
 
 func (s *DDSketch) value(i int) float64 { return math.Exp(float64(i)*s.logGamma) * s.vmul }
 
-// Add records a value. A NaN or infinite value is rejected with an error wrapping
-// ErrInvalidInput and leaves the sketch unchanged.
+// Add records a value. A NaN or infinite value, or a finite value whose magnitude is
+// so extreme (near the ends of the float64 range) that its bucket boundary would
+// overflow or underflow, is rejected with an error wrapping ErrInvalidInput and
+// leaves the sketch unchanged.
 func (s *DDSketch) Add(v float64) error {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return fmt.Errorf("%w: cannot add %g to a DDSketch", ErrInvalidInput, v)
@@ -89,10 +126,18 @@ func (s *DDSketch) Add(v float64) error {
 	case v == 0:
 		s.zeroCount++
 	case v > 0:
-		s.pos[s.index(v)]++
+		i := s.index(v)
+		if !s.representable(i) {
+			return fmt.Errorf("%w: magnitude %g is outside the representable range of a DDSketch at alpha=%g", ErrInvalidInput, v, s.alpha)
+		}
+		s.pos[i]++
 		s.collapse(s.pos)
 	default:
-		s.neg[s.index(-v)]++
+		i := s.index(-v)
+		if !s.representable(i) {
+			return fmt.Errorf("%w: magnitude %g is outside the representable range of a DDSketch at alpha=%g", ErrInvalidInput, v, s.alpha)
+		}
+		s.neg[i]++
 		s.collapse(s.neg)
 	}
 	s.count++
@@ -152,8 +197,18 @@ func (s *DDSketch) Quantile(q float64) (float64, error) {
 			return s.value(i), nil
 		}
 	}
-	// Unreachable for count >= 1, since cum ends at count > rank; return the max.
-	return s.value(posIdx[len(posIdx)-1]), nil
+	// We can arrive here even though count >= 1: above 2^53 the float64 cumulative
+	// cannot exceed a rank built from the same magnitude, since consecutive integers
+	// are no longer distinguishable. q is then effectively at the very top, so return
+	// the maximum value present, guarding against any of the three stores being empty.
+	switch {
+	case len(posIdx) > 0:
+		return s.value(posIdx[len(posIdx)-1]), nil
+	case s.zeroCount > 0:
+		return 0, nil
+	default:
+		return -s.value(negIdx[0]), nil
+	}
 }
 
 // Merge folds other into s. Both must have the same alpha; a mismatch returns an
@@ -273,11 +328,11 @@ func DecodeDDSketch(data []byte) (*DDSketch, error) {
 	}
 	bucketCap := maxPossibleBuckets(s.logGamma)
 	sum := zeroCount
-	posSum, err := readBuckets(r, s.pos, bucketCap)
+	posSum, err := readBuckets(r, s, s.pos, bucketCap)
 	if err != nil {
 		return nil, err
 	}
-	negSum, err := readBuckets(r, s.neg, bucketCap)
+	negSum, err := readBuckets(r, s, s.neg, bucketCap)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +350,7 @@ func DecodeDDSketch(data []byte) (*DDSketch, error) {
 
 const maxUint31 = 1<<31 - 1
 
-func readBuckets(r *reader, m map[int]uint64, maxCap int) (uint64, error) {
+func readBuckets(r *reader, s *DDSketch, m map[int]uint64, maxCap int) (uint64, error) {
 	n, err := r.readUvarint()
 	if err != nil {
 		return 0, err
@@ -315,6 +370,9 @@ func readBuckets(r *reader, m map[int]uint64, maxCap int) (uint64, error) {
 		}
 		if c == 0 {
 			return 0, fmt.Errorf("%w: zero-count bucket", ErrBadData)
+		}
+		if !s.representable(int(idx)) {
+			return 0, fmt.Errorf("%w: bucket index %d maps to a non-representable value", ErrBadData, idx)
 		}
 		if _, dup := m[int(idx)]; dup {
 			return 0, fmt.Errorf("%w: duplicate bucket index %d", ErrBadData, idx)

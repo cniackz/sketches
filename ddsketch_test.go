@@ -200,6 +200,93 @@ func TestDDSketchInvalidInput(t *testing.T) {
 	}
 }
 
+// TestDDSketchExtremeMagnitude is posterior D1: a magnitude so large that its bucket
+// boundary overflows float64 used to make Quantile return +Inf. Add now rejects it
+// (the guarantee cannot hold there), and a value just inside the range is accepted
+// and returns a finite quantile.
+func TestDDSketchExtremeMagnitude(t *testing.T) {
+	s, _ := NewDDSketch(0.01)
+	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, -math.SmallestNonzeroFloat64} {
+		if err := s.Add(v); err == nil {
+			t.Fatalf("Add(%g) should be rejected as out of representable range", v)
+		}
+	}
+	if s.Count() != 0 {
+		t.Fatal("rejected extreme adds should not change the sketch")
+	}
+	// A large but representable magnitude is accepted and its quantile stays finite.
+	big := 1e300
+	if err := s.Add(big); err != nil {
+		t.Fatalf("Add(%g) should be accepted: %v", big, err)
+	}
+	got, err := s.Quantile(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.IsInf(got, 0) || math.IsNaN(got) {
+		t.Fatalf("Quantile returned %g for a representable value", got)
+	}
+	if math.Abs(got-big) > 0.01*big {
+		t.Fatalf("Quantile %g not within alpha of %g", got, big)
+	}
+	// A crafted encoding with an out-of-range bucket index is rejected by decode.
+	s2, _ := NewDDSketch(0.01)
+	s2.Add(1)
+	enc := s2.Encode()
+	bad, err := DecodeDDSketch(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.pos[s2.maxIdx+1000] = 1
+	bad.count++
+	if _, err := DecodeDDSketch(bad.Encode()); err == nil {
+		t.Fatal("decode of a non-representable bucket index should fail")
+	}
+}
+
+// TestDDSketchAlphaFloor is posterior D2: an alpha below the float64 precision floor
+// breaks the relative-error guarantee, so the constructor rejects it.
+func TestDDSketchAlphaFloor(t *testing.T) {
+	for _, a := range []float64{1e-15, 1e-12, 1e-10} {
+		if _, err := NewDDSketch(a); err == nil {
+			t.Fatalf("NewDDSketch(%g) should be rejected below the alpha floor", a)
+		}
+	}
+	// The floor itself and anything above it is accepted.
+	for _, a := range []float64{ddMinAlpha, 1e-6, 0.01} {
+		if _, err := NewDDSketch(a); err != nil {
+			t.Fatalf("NewDDSketch(%g) should be accepted: %v", a, err)
+		}
+	}
+}
+
+// TestDDSketchHugeCountQuantile is posterior D4: a (decoded) count above 2^53, where
+// float64 cannot distinguish consecutive integers, used to panic in Quantile(1) when
+// the positive store was empty. It must now return a finite value without panicking.
+func TestDDSketchHugeCountQuantile(t *testing.T) {
+	s, _ := NewDDSketch(0.01)
+	// Only negatives, with a count above 2^53.
+	s.neg[s.index(2)] = 1 << 53
+	s.count = 1 << 53
+	for _, q := range []float64{0, 0.5, 1} {
+		v, err := s.Quantile(q)
+		if err != nil {
+			t.Fatalf("q=%g: %v", q, err)
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Fatalf("q=%g returned %g", q, v)
+		}
+	}
+	// The same through a decoded sketch, to exercise the decode path.
+	dec, err := DecodeDDSketch(s.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dec.Quantile(1); err != nil {
+		t.Fatalf("decoded Quantile(1): %v", err)
+	}
+}
+
 func TestDDSketchDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},

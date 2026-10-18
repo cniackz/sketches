@@ -144,6 +144,47 @@ func TestHLLParamValidation(t *testing.T) {
 	}
 }
 
+// TestHLLTransitionBias is posterior H1: because the HLL++ bias-correction tables are
+// not reproduced, the raw estimate is positively biased by a few percent in the
+// transition band just above the linear-counting handoff (about 2.5*m to 3*m distinct
+// items). This pins that documented limit so a regression cannot widen it silently:
+// the band bias stays within 3%, and outside the band the bias returns to within 1%.
+func TestHLLTransitionBias(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping bias sweep in short mode")
+	}
+	const p = 14
+	m := uint64(1) << p
+	meanBias := func(mult float64) float64 {
+		n := uint64(mult * float64(m))
+		const trials = 80
+		var sum float64
+		for tr := 0; tr < trials; tr++ {
+			h, _ := NewHLL(p)
+			base := uint64(tr+1) * 0x9e3779b97f4a7c15
+			for i := uint64(0); i < n; i++ {
+				h.Add(hllKey(base + i))
+			}
+			sum += float64(h.Estimate())/float64(n) - 1
+		}
+		return sum / trials
+	}
+	for _, mult := range []float64{2.4, 2.5, 2.7, 3.0} {
+		b := meanBias(mult)
+		t.Logf("transition n=%.1f*m: bias=%.5f", mult, b)
+		if math.Abs(b) > 0.03 {
+			t.Fatalf("transition bias %.5f at %.1f*m exceeds the documented 3%%", b, mult)
+		}
+	}
+	for _, mult := range []float64{1.5, 2.0, 4.0, 6.0} {
+		b := meanBias(mult)
+		t.Logf("outside band n=%.1f*m: bias=%.5f", mult, b)
+		if math.Abs(b) > 0.01 {
+			t.Fatalf("bias %.5f at %.1f*m exceeds 1%% outside the transition band", b, mult)
+		}
+	}
+}
+
 func TestHLLDecodeRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		{},

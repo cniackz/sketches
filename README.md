@@ -17,10 +17,18 @@ parameters do not justify.
 
 | Structure | Guarantee | Parameter |
 |---|---|---|
-| DDSketch | `Quantile(q)` within `alpha` relative error of the true `x_q`, for every finite value | relative accuracy `alpha` |
-| HyperLogLog | relative standard error about `1.04/sqrt(m)`, `m = 2^p` (statistical, not per-estimate) | precision `p` |
+| DDSketch | `Quantile(q)` within `alpha` relative error of the true `x_q`, for every finite value whose magnitude is not at the extreme ends of the float64 range | relative accuracy `alpha` in `[1e-9, 1)` |
+| HyperLogLog | relative standard error about `1.04/sqrt(m)`, `m = 2^p` (statistical, not per-estimate; see the transition-band note below) | precision `p` |
 | count-min | `f(x) <= Estimate(x) <= f(x) + epsilon*N` with probability `>= 1-delta`, never under | `epsilon`, `delta` |
 | t-digest | none in the worst case; empirically accurate, finest resolution in the tails | `compression` |
+
+`DDSketch` rejects an `alpha` below `1e-9` (float64 cannot honor a finer relative
+error) and rejects a value whose magnitude is so extreme that its bucket boundary
+would overflow or underflow in float64. `HyperLogLog`, because it omits the HLL++
+bias-correction tables, is positively biased by up to a few percent in a narrow
+transition band just above where linear counting hands off to the raw estimate (about
+`2.5*m` to `3*m` distinct items, measured about +2.4% at `p=14`); outside that band the
+error returns to about `1.04/sqrt(m)`.
 
 DDSketch carries a worst-case bound; t-digest does not. Use DDSketch when you need a
 provable relative error, and t-digest when tail accuracy at a small size matters more.
@@ -56,7 +64,12 @@ matching `Decode...` function.
 ## Merging and serialization
 
 `Merge` combines two summaries built with the same parameters; a mismatch returns an
-error wrapping `ErrIncompatibleMerge`. The merge is order-independent. `Encode`
+error wrapping `ErrIncompatibleMerge`. For DDSketch, HyperLogLog and count-min the
+merge is exactly order-independent (it is bucket-wise addition or a register-wise
+maximum). For t-digest the merge is only approximately order-independent: like adding
+values in a different order, merging in a different order yields slightly different
+centroids and so slightly different quantiles, within the usual empirical accuracy.
+`Encode`
 returns a versioned binary form that `DecodeDDSketch`, `DecodeHLL`,
 `DecodeCountMin` and `DecodeTDigest` parse back. HyperLogLog has a sparse form for
 low cardinality and a dense form for high; the format byte records which, and both
